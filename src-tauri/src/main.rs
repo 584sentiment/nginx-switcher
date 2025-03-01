@@ -3,6 +3,7 @@ use std::fs;
 use std::net::IpAddr;
 use std::path::Path;
 use std::str::FromStr;
+use tauri_plugin_fs::FsExt;
 
 #[derive(Debug, Serialize, Clone)]
 pub struct HostEntry {
@@ -18,6 +19,7 @@ struct CommandError {
 }
 
 // 获取hosts文件的系统路径
+#[tauri::command]
 fn get_hosts_path() -> &'static Path {
     #[cfg(target_os = "windows")]
     {
@@ -38,31 +40,48 @@ fn get_hosts_entries() -> Result<Vec<HostEntry>, CommandError> {
         message: format!("Failed to read hosts file: {}", e),
     })?;
 
-    Ok(parse_hosts_content(&content))
+    Ok(parse_hosts_content(content))
 }
 
 // 解析 hosts 文件内容
-fn parse_hosts_content(content: &str) -> Vec<HostEntry> {
+#[tauri::command]
+fn parse_hosts_content(content: String) -> Vec<HostEntry> {
     let mut entries = Vec::new();
 
     for line in content.lines() {
-        // 去除注释部分
-        let line_content = if let Some(idx) = line.find('#') {
-            &line[0..idx]
+        // 保存原始行内容用于输出
+        let original_line = line.to_string();
+
+        // 检查行是否被注释
+        let is_commented = line.trim_start().starts_with('#');
+        let mut working_line = line.to_string();
+
+        // 如果是注释行，移除开头的#并处理其后的内容
+        if is_commented {
+            // 找到第一个不是空白和#的字符的位置
+            if let Some(first_char_pos) = line.find(|c| c != '#' && c != ' ' && c != '\t') {
+                working_line = line[first_char_pos..].to_string();
+            } else {
+                // 如果整行都是#或空白，跳过
+                continue;
+            }
         } else {
-            line
-        };
+            // 非注释行，但需要移除行内注释
+            if let Some(idx) = line.find('#') {
+                working_line = line[0..idx].to_string();
+            }
+        }
 
         // 去除前后空白
-        let line_content = line_content.trim();
+        let working_line = working_line.trim();
 
         // 跳过空行
-        if line_content.is_empty() {
+        if working_line.is_empty() {
             continue;
         }
 
         // 分割IP和主机名
-        let mut parts = line_content.split_whitespace();
+        let mut parts = working_line.split_whitespace();
 
         if let Some(ip_str) = parts.next() {
             // 验证是否是有效的IP地址
@@ -75,12 +94,11 @@ fn parse_hosts_content(content: &str) -> Vec<HostEntry> {
 
                 // 只有存在主机名时才添加条目
                 if !hostnames.is_empty() {
-                    let enabled = !line.trim_start().starts_with('#');
                     entries.push(HostEntry {
                         ip: ip_str.to_string(),
                         hostnames,
-                        line: line.to_string(),
-                        enabled,
+                        line: original_line,
+                        enabled: !is_commented,
                     });
                 }
             }
@@ -175,6 +193,43 @@ fn toggle_host_ip_status(ip_address: String) -> Result<bool, CommandError> {
     Ok(true)
 }
 
+#[tauri::command]
+async fn modify_hosts_file(content: String) -> Result<(), String> {
+    let hosts_path = if cfg!(target_os = "windows") {
+        "C:\\Windows\\System32\\drivers\\etc\\hosts"
+    } else {
+        "/etc/hosts"
+    };
+
+    #[cfg(target_os = "macos")]
+    {
+        use std::process::Command;
+
+        // 创建临时文件
+        let temp_file = "/tmp/hosts_temp";
+        std::fs::write(temp_file, content).map_err(|e| e.to_string())?;
+
+        // 使用osascript请求管理员权限
+        let script = format!(
+            "do shell script \"cp {} {}\" with administrator privileges",
+            temp_file, hosts_path
+        );
+
+        let output = Command::new("osascript")
+            .args(&["-e", &script])
+            .output()
+            .map_err(|e| e.to_string())?;
+
+        if !output.status.success() {
+            return Err(String::from_utf8_lossy(&output.stderr).to_string());
+        }
+    }
+
+    // 其他平台的实现...
+
+    Ok(())
+}
+
 // 扩展函数：获取特定IP地址的状态
 #[tauri::command]
 fn get_ip_status(ip_address: String) -> Result<bool, CommandError> {
@@ -194,11 +249,24 @@ fn get_ip_status(ip_address: String) -> Result<bool, CommandError> {
 // 在主函数中注册命令
 fn main() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_fs::init())
+        .setup(|app| {
+            // 定义hosts文件路径
+            let hosts_path = get_hosts_path();
+
+            // 注册自定义路径
+            let _ = app.fs_scope().allow_directory(hosts_path, true);
+
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
+            get_hosts_path,
             get_hosts_entries,
             get_hosts_raw,
             get_ip_status,
+            parse_hosts_content,
             toggle_host_ip_status,
+            modify_hosts_file,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
